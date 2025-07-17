@@ -71,7 +71,7 @@ async function setupFiles() {
   fs.chmodSync('2', 0o755);
 }
 
-// 写入配置文件
+// 写入配置文件 - 恢复原始配置，仅保留必要的 VMess 配置
 function writeConfig() {
   console.log('生成配置文件: config.json');
   const config = {
@@ -80,20 +80,12 @@ function writeConfig() {
         "level": "info",
         "timestamp": true
     },
-    "dns": {
-        "servers": [
-        {
-          "tag": "google",
-          "address": "tls://8.8.8.8"
-        }
-      ]
-    },
     "inbounds": [
     {
       "tag": "vmess-ws-in",
       "type": "vmess",
       "listen": "::",
-      "listen_port": ARGO_PORT, // 使用非特权端口
+      "listen_port": ARGO_PORT,
         "users": [
         {
           "uuid": UUID
@@ -125,7 +117,7 @@ function writeConfig() {
   console.log(`配置文件已生成，listen_port=${config.inbounds[0].listen_port} (类型: ${typeof config.inbounds[0].listen_port})`);
 }
 
-// 设置Cloudflare隧道配置
+// 设置Cloudflare隧道配置 - 修改：针对临时域名和自定义域名分别处理
 function setupTunnel() {
   console.log('配置Cloudflare隧道...');
   if (ARGO_AUTH && ARGO_DOMAIN) {
@@ -142,10 +134,10 @@ protocol: http2
 
 ingress:
   - hostname: ${ARGO_DOMAIN}
-    service: http://localhost:${ARGO_PORT}  # 隧道指向非特权端口
+    service: http://localhost:${ARGO_PORT}
     originRequest:
       noTLSVerify: true
-  - service: http_status:200`;  // 修改为 200 OK 响应
+  - service: http_status:200`;
       
       fs.writeFileSync('tunnel.yml', tunnelConfig);
       console.log(`隧道配置已生成，使用域名: ${ARGO_DOMAIN}`);
@@ -154,10 +146,12 @@ ingress:
     }
   } else {
     console.log('未提供ARGO_AUTH和ARGO_DOMAIN，使用临时域名');
+    // 临时域名不需要配置文件，由cloudflared自动处理
+    // 但需要确保启动命令中正确设置了默认响应
   }
 }
 
-// 启动服务
+// 启动服务 - 修改：针对临时域名修改启动命令
 async function startServices() {
   return new Promise((resolve, reject) => {
     console.log(`启动sing-box服务（端口: ${ARGO_PORT}）...`);
@@ -176,7 +170,7 @@ async function startServices() {
         execSync('pgrep -f "./1 run"');
         console.log('sing-box启动成功');
         
-        // 启动cloudflared（隧道指向非特权端口）
+        // 启动cloudflared
         let cloudflaredCommand;
         if (ARGO_AUTH && ARGO_DOMAIN) {
           if (ARGO_AUTH.includes('TunnelSecret')) {
@@ -185,7 +179,8 @@ async function startServices() {
             cloudflaredCommand = `./2 tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token "${ARGO_AUTH}"`;
           }
         } else {
-          cloudflaredCommand = `./2 tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile boot.log --loglevel info --url http://localhost:${ARGO_PORT}`;
+          // 临时域名模式：添加--hello-world参数确保默认响应为200 OK
+          cloudflaredCommand = `./2 tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile boot.log --loglevel info --hello-world --url http://localhost:${ARGO_PORT}`;
         }
         
         console.log('启动cloudflared服务...');
@@ -287,7 +282,7 @@ async function main() {
       "v": "2", 
       "ps": NAME, 
       "add": CFIP, 
-      "port": CFPORT,  // 外部访问端口仍为 443（Cloudflare 会处理转发）
+      "port": CFPORT,
       "id": UUID, 
       "aid": "0", 
       "scy": "none", 
@@ -301,6 +296,7 @@ async function main() {
       "fp": ""
     };
     
+    console.log(`保活功能已启用 - 访问 https://${argodomain}/ 应返回 200 OK`);
     
     // 保持进程运行
     await new Promise(() => {});
@@ -310,4 +306,4 @@ async function main() {
   }
 }
 
-main(); 
+main();
