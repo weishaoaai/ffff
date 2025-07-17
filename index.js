@@ -1,7 +1,7 @@
 const { execSync, exec } = require('child_process');
 const fs = require('fs');
 const http = require('http');
-const net = require('net'); // 新增 net 模块用于端口复用
+const net = require('net');
 const path = require('path');
 const https = require('https');
 
@@ -105,8 +105,8 @@ function writeConfig() {
     {
       "tag": "vmess-ws-in",
       "type": "vmess",
-      "listen": "127.0.0.1", // 改为监听本地回环地址
-      "listen_port": ARGO_PORT + 1, // 使用 ARGO_PORT+1 作为内部端口
+      "listen": "127.0.0.1",
+      "listen_port": ARGO_PORT + 1,
         "users": [
         {
           "uuid": UUID
@@ -177,10 +177,10 @@ function keepTunnelAlive() {
   }
 
   const protocol = SELF_URL.startsWith('https') ? https : http;
-  protocol.get(SELF_URL, keepAliveOptions, (res) => {
+  protocol.get(`${SELF_URL}/health`, keepAliveOptions, (res) => {
     if (res.statusCode >= 200 && res.statusCode < 300) {
       if (!lastSuccess) {
-        console.log(`隧道保活成功: ${SELF_URL}`);
+        console.log(`隧道保活成功: ${SELF_URL}/health`);
         lastSuccess = true;
       }
     } else {
@@ -194,11 +194,17 @@ function keepTunnelAlive() {
   });
 }
 
-// 创建HTTP服务器（仅用于生成响应）
+// 创建HTTP服务器（处理/health路径）
 const httpServer = http.createServer((req, res) => {
-  res.statusCode = 200;
-  res.setHeader('Content-Type', 'text/plain');
-  res.end('OK');
+  // 只处理/health路径，其他路径返回404
+  if (req.url === '/health') {
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'text/plain');
+    res.end('OK');
+  } else {
+    res.statusCode = 404;
+    res.end();
+  }
 });
 
 // 启动服务
@@ -222,17 +228,13 @@ async function startServices() {
         
         // 创建TCP服务器实现端口复用
         const tcpServer = net.createServer((socket) => {
-          // 用于判断协议的缓冲区
           let protocolBuffer = Buffer.alloc(0);
           let protocolDetermined = false;
           
           socket.on('data', (chunk) => {
-            // 合并数据块用于协议检测
             protocolBuffer = Buffer.concat([protocolBuffer, chunk]);
             
-            // 只在协议未确定时进行检测
             if (!protocolDetermined) {
-              // 检测是否为HTTP请求（简单检查是否包含HTTP/1.1或GET/POST等）
               const isHttp = protocolBuffer.toString('utf8').includes('HTTP/1.1') || 
                             protocolBuffer.toString('utf8').includes('GET ') || 
                             protocolBuffer.toString('utf8').includes('POST ');
@@ -240,13 +242,10 @@ async function startServices() {
               protocolDetermined = true;
               
               if (isHttp) {
-                // 处理HTTP请求
                 console.log('接收到HTTP请求，转发到HTTP服务器');
                 httpServer.emit('connection', socket);
-                // 将已接收的数据发送给HTTP服务器
                 socket.unshift(protocolBuffer);
               } else {
-                // 处理非HTTP请求（转发给sing-box）
                 console.log('接收到非HTTP请求，转发到sing-box');
                 const singBoxSocket = net.connect(ARGO_PORT + 1, '127.0.0.1', () => {
                   singBoxSocket.write(protocolBuffer);
@@ -266,7 +265,7 @@ async function startServices() {
         // 监听ARGO_PORT
         tcpServer.listen(ARGO_PORT, () => {
           console.log(`TCP复用服务器已启动，监听端口: ${ARGO_PORT}`);
-          console.log(`HTTP请求将在此端口处理，其他流量将转发到sing-box (${ARGO_PORT + 1})`);
+          console.log(`HTTP请求(/health)将在此端口处理，其他流量将转发到sing-box (${ARGO_PORT + 1})`);
         });
         
         tcpServer.on('error', (err) => {
@@ -364,7 +363,7 @@ function getArgoDomain() {
             clearInterval(interval);
             const domain = match[1];
             SELF_URL = `https://${domain}`;
-            console.log(`获取到临时域名: ${domain}，保活链接: ${SELF_URL}`);
+            console.log(`获取到临时域名: ${domain}，保活链接: ${SELF_URL}/health`);
             
             // 启动保活定时器
             setInterval(keepTunnelAlive, 30000);
