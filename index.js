@@ -71,7 +71,7 @@ async function setupFiles() {
   fs.chmodSync('2', 0o755);
 }
 
-// 写入配置文件 - 修改：添加 HTTP inbound 用于保活
+// 写入配置文件 - 修改：简化 HTTP inbound 配置
 function writeConfig() {
   console.log('生成配置文件: config.json');
   const config = {
@@ -113,8 +113,7 @@ function writeConfig() {
       "listen_port": ARGO_PORT,
       "domain_strategy": "prefer_ipv4",
       "sniff": true,
-      "sniff_override_destination": true,
-      "rule_engine": "golang"
+      "sniff_override_destination": true
     }
    ],
   "outbounds": [
