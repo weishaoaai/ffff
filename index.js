@@ -3,17 +3,19 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 
-// 环境变量设置
+// 环境变量设置，修正端口为整数类型
 const UUID = process.env.UUID || '86391f6e-87ca-4665-8445-6a8d413c7fa9';
 const ARGO_AUTH = process.env.ARGO_AUTH || '';
 const CFIP = process.env.CFIP || 'www.visa.com.tw';
 const NAME = process.env.NAME || 'app.koyeb.com';
-const ARGO_PORT = process.env.ARGO_PORT || '443';
-const CFPORT = process.env.CFPORT || '443';
+const ARGO_PORT = process.env.ARGO_PORT ? parseInt(process.env.ARGO_PORT, 10) : 443;
+const CFPORT = process.env.CFPORT ? parseInt(process.env.CFPORT, 10) : 443;
 const ARGO_DOMAIN = process.env.ARGO_DOMAIN || '';
 const FILE_PATH = process.env.FILE_PATH || 'world';
 const SING_BOX_URL = "https://raw.githubusercontent.com/weishaoaai/sssss/main/sing-box";
 const CLOUDFLARED_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64";
+
+console.log(`环境配置: ARGO_PORT=${ARGO_PORT} (类型: ${typeof ARGO_PORT}), CFPORT=${CFPORT} (类型: ${typeof CFPORT})`);
 
 // 创建目录
 fs.mkdirSync(FILE_PATH, { recursive: true });
@@ -29,11 +31,18 @@ try {
 // 下载文件函数
 function downloadFile(url, dest) {
   return new Promise((resolve, reject) => {
+    console.log(`开始下载: ${url}`);
     const file = fs.createWriteStream(dest);
     https.get(url, response => {
+      if (response.statusCode !== 200) {
+        file.destroy();
+        reject(new Error(`下载失败，状态码: ${response.statusCode}`));
+        return;
+      }
       response.pipe(file);
       file.on('finish', () => {
         file.close();
+        console.log(`下载完成: ${dest}`);
         resolve();
       });
     }).on('error', err => {
@@ -55,6 +64,7 @@ async function setupFiles() {
 
 // 写入配置文件
 function writeConfig() {
+  console.log('生成配置文件: config.json');
   const config = {
     "log": {
         "disabled": true,
@@ -103,10 +113,12 @@ function writeConfig() {
   };
   
   fs.writeFileSync('config.json', JSON.stringify(config, null, 2));
+  console.log(`配置文件已生成，listen_port=${config.inbounds[0].listen_port} (类型: ${typeof config.inbounds[0].listen_port})`);
 }
 
 // 设置Cloudflare隧道配置
 function setupTunnel() {
+  console.log('配置Cloudflare隧道...');
   if (ARGO_AUTH && ARGO_DOMAIN) {
     if (ARGO_AUTH.includes('TunnelSecret')) {
       fs.writeFileSync('tunnel.json', ARGO_AUTH);
@@ -127,17 +139,24 @@ ingress:
   - service: http_status:404`;
       
       fs.writeFileSync('tunnel.yml', tunnelConfig);
+      console.log(`隧道配置已生成，使用域名: ${ARGO_DOMAIN}`);
+    } else {
+      console.log('使用令牌认证方式配置隧道');
     }
+  } else {
+    console.log('未提供ARGO_AUTH和ARGO_DOMAIN，使用临时域名');
   }
 }
 
 // 启动服务
 async function startServices() {
   return new Promise((resolve, reject) => {
+    console.log('启动sing-box服务...');
     // 启动sing-box
     const singBoxProcess = exec('./1 run -c config.json', (error, stdout, stderr) => {
       if (error) {
-        console.error(`sing-box error: ${error.message}`);
+        console.error(`sing-box启动失败: ${error.message}`);
+        if (stderr) console.error(`sing-box错误详情: ${stderr}`);
         reject(error);
       }
     });
@@ -146,7 +165,7 @@ async function startServices() {
     setTimeout(() => {
       try {
         execSync('pgrep -f "./1 run"');
-        console.log('sing-box started successfully');
+        console.log('sing-box启动成功');
         
         // 启动cloudflared
         let cloudflaredCommand;
@@ -160,10 +179,13 @@ async function startServices() {
           cloudflaredCommand = `./2 tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile boot.log --loglevel info --url http://localhost:${ARGO_PORT}`;
         }
         
+        console.log('启动cloudflared服务...');
         const cloudflaredProcess = exec(cloudflaredCommand, (error, stdout, stderr) => {
           if (error) {
-            console.error(`cloudflared error: ${error.message}`);
+            console.error(`cloudflared启动失败: ${error.message}`);
+            if (stderr) console.error(`cloudflared错误详情: ${stderr}`);
             if (fs.existsSync('boot.log')) {
+              console.log('cloudflared日志内容:');
               console.log(fs.readFileSync('boot.log', 'utf8'));
             }
             reject(error);
@@ -174,31 +196,34 @@ async function startServices() {
         setTimeout(() => {
           try {
             execSync('pgrep -f "./2 tunnel"');
-            console.log('cloudflared started successfully');
+            console.log('cloudflared启动成功');
             resolve();
           } catch (e) {
-            console.error('cloudflared failed to start');
+            console.error('cloudflared启动失败');
             if (fs.existsSync('boot.log')) {
+              console.log('cloudflared日志内容:');
               console.log(fs.readFileSync('boot.log', 'utf8'));
             }
-            reject(new Error('cloudflared failed to start'));
+            reject(new Error('cloudflared启动失败'));
           }
         }, 2000);
         
       } catch (e) {
-        console.error('sing-box failed to start');
-        reject(new Error('sing-box failed to start'));
+        console.error('sing-box启动失败');
+        reject(new Error('sing-box启动失败'));
       }
     }, 2000);
     
     // 捕获退出信号，清理进程
     process.on('SIGINT', () => {
-      console.log('\nStopping services...');
+      console.log('\n接收到退出信号，正在停止服务...');
       try {
         execSync('pkill -f "./1 run"');
         execSync('pkill -f "./2 tunnel"');
-        console.log('Services stopped');
-      } catch (e) {}
+        console.log('服务已成功停止');
+      } catch (e) {
+        console.error('停止服务时出错:', e.message);
+      }
       process.exit(0);
     });
   });
@@ -207,8 +232,10 @@ async function startServices() {
 // 获取Argo域名
 function getArgoDomain() {
   if (ARGO_DOMAIN) {
-    return ARGO_DOMAIN;
+    console.log(`使用预设域名: ${ARGO_DOMAIN}`);
+    return Promise.resolve(ARGO_DOMAIN);
   } else {
+    console.log('等待Cloudflare分配临时域名...');
     let retry = 0;
     const maxRetries = 10;
     
@@ -217,6 +244,7 @@ function getArgoDomain() {
         retry++;
         if (retry > maxRetries) {
           clearInterval(interval);
+          console.error('获取临时域名超时');
           resolve('unknown.trycloudflare.com');
           return;
         }
@@ -226,7 +254,9 @@ function getArgoDomain() {
           const match = logContent.match(/https:\/\/([^/]*trycloudflare\.com)/);
           if (match) {
             clearInterval(interval);
-            resolve(match[1]);
+            const domain = match[1];
+            console.log(`获取到临时域名: ${domain}`);
+            resolve(domain);
           }
         }
       }, 2000);
@@ -237,6 +267,7 @@ function getArgoDomain() {
 // 主函数
 async function main() {
   try {
+    console.log('开始部署服务...');
     await setupFiles();
     writeConfig();
     setupTunnel();
@@ -264,12 +295,13 @@ async function main() {
     const vmessBase64 = Buffer.from(JSON.stringify(VMESS)).toString('base64');
     fs.writeFileSync('boot.log', `vmess://${vmessBase64}`);
     
-    console.log("hello");
+    console.log("部署完成!");
+    console.log(`VMess链接: vmess://${vmessBase64}`);
     
     // 保持进程运行
     await new Promise(() => {});
   } catch (error) {
-    console.error('Error:', error.message);
+    console.error('部署过程中出现错误:', error.message);
     process.exit(1);
   }
 }
