@@ -11,6 +11,7 @@ const ARGO_AUTH = process.env.ARGO_AUTH || '';
 const CFIP = process.env.CFIP || 'www.visa.com.tw';
 const NAME = process.env.NAME || 'app.koyeb.com';
 const ARGO_PORT = process.env.ARGO_PORT ? parseInt(process.env.ARGO_PORT, 10) : 8080;
+const INTERNAL_SINGBOX_PORT = 8082; // sing-box 内部监听端口
 const CFPORT = process.env.CFPORT ? parseInt(process.env.CFPORT, 10) : 443;
 const ARGO_DOMAIN = process.env.ARGO_DOMAIN || '';
 const FILE_PATH = process.env.FILE_PATH || 'world';
@@ -18,6 +19,7 @@ const SING_BOX_URL = "https://raw.githubusercontent.com/weishaoaai/sssss/main/si
 const CLOUDFLARED_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64";
 
 console.log(`环境配置: ARGO_PORT=${ARGO_PORT} (类型: ${typeof ARGO_PORT}), CFPORT=${CFPORT} (类型: ${typeof CFPORT})`);
+console.log(`内部配置: INTERNAL_SINGBOX_PORT=${INTERNAL_SINGBOX_PORT}`);
 
 // 创建目录
 fs.mkdirSync(FILE_PATH, { recursive: true });
@@ -92,7 +94,7 @@ function writeConfig() {
       "tag": "vmess-ws-in",
       "type": "vmess",
       "listen": "::",
-      "listen_port": ARGO_PORT,
+      "listen_port": INTERNAL_SINGBOX_PORT, // 使用内部端口
         "users": [
         {
           "uuid": UUID
@@ -188,7 +190,7 @@ async function startServices() {
         if (isWebSocket && isKingPath) {
           // WebSocket请求转发给sing-box处理
           console.log('转发WebSocket请求到sing-box');
-          const singBoxSocket = net.connect(ARGO_PORT, '127.0.0.1', () => {
+          const singBoxSocket = net.connect(INTERNAL_SINGBOX_PORT, '127.0.0.1', () => {
             singBoxSocket.write(data);
             socket.pipe(singBoxSocket);
             singBoxSocket.pipe(socket);
@@ -212,7 +214,7 @@ async function startServices() {
       console.log(`TCP多路复用服务器已启动，监听端口 ${ARGO_PORT}`);
       
       // 启动sing-box
-      console.log(`启动sing-box服务（端口: ${ARGO_PORT}）...`);
+      console.log(`启动sing-box服务（端口: ${INTERNAL_SINGBOX_PORT}）...`);
       const singBoxProcess = exec('./1 run -c config.json', (error, stdout, stderr) => {
         if (error) {
           console.error(`sing-box启动失败: ${error.message}`);
