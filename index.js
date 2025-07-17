@@ -71,7 +71,7 @@ async function setupFiles() {
   fs.chmodSync('2', 0o755);
 }
 
-// 写入配置文件 - 修改：简化 HTTP inbound 配置
+// 写入配置文件
 function writeConfig() {
   console.log('生成配置文件: config.json');
   const config = {
@@ -104,16 +104,6 @@ function writeConfig() {
         "path": "/king",
         "early_data_header_name": "Sec-WebSocket-Protocol"
       }
-    },
-    // 添加 HTTP inbound 用于处理 /200 请求
-    {
-      "tag": "http-keepalive",
-      "type": "http",
-      "listen": "::",
-      "listen_port": ARGO_PORT,
-      "domain_strategy": "prefer_ipv4",
-      "sniff": true,
-      "sniff_override_destination": true
     }
    ],
   "outbounds": [
@@ -127,14 +117,6 @@ function writeConfig() {
     }
   ],
   "route": {
-    "rules": [
-      {
-        "type": "field",
-        "protocol": "http",
-        "path": ["/200"],
-        "outbound_tag": "direct"
-      }
-    ],
     "final": "direct"
   }
   };
@@ -163,7 +145,7 @@ ingress:
     service: http://localhost:${ARGO_PORT}  # 隧道指向非特权端口
     originRequest:
       noTLSVerify: true
-  - service: http_status:404`;
+  - service: http_status:200`;  // 修改为 200 OK 响应
       
       fs.writeFileSync('tunnel.yml', tunnelConfig);
       console.log(`隧道配置已生成，使用域名: ${ARGO_DOMAIN}`);
@@ -319,7 +301,6 @@ async function main() {
       "fp": ""
     };
     
-    console.log(`保活功能已启用 - 访问 https://${argodomain}/200 应返回 200 OK`);
     
     // 保持进程运行
     await new Promise(() => {});
@@ -329,4 +310,4 @@ async function main() {
   }
 }
 
-main();
+main(); 
