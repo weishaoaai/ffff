@@ -1,20 +1,35 @@
 const { execSync, exec } = require('child_process');
 const fs = require('fs');
+const http = require('http');
+const net = require('net'); // 新增 net 模块用于端口复用
 const path = require('path');
 const https = require('https');
 
-// 环境变量设置，关键修改：将默认端口改为 8080（非特权端口）
+// 环境变量设置
 const UUID = process.env.UUID || '96ce5271-7a3b-455b-adb3-69772d34d34e';
 const ARGO_AUTH = process.env.ARGO_AUTH || '';
 const CFIP = process.env.CFIP || 'www.visa.com.tw';
 const NAME = process.env.NAME || 'app.koyeb.com';
-// 关键修改：默认端口改为 8080（1024 以上，无需特权）
 const ARGO_PORT = process.env.ARGO_PORT ? parseInt(process.env.ARGO_PORT, 10) : 8080;
-const CFPORT = process.env.CFPORT ? parseInt(process.env.CFPORT, 10) : 443; // CFPORT 保持 443 不影响，因为是外部访问端口
+const CFPORT = process.env.CFPORT ? parseInt(process.env.CFPORT, 10) : 443;
 const ARGO_DOMAIN = process.env.ARGO_DOMAIN || '';
 const FILE_PATH = process.env.FILE_PATH || 'world';
 const SING_BOX_URL = "https://raw.githubusercontent.com/weishaoaai/sssss/main/sing-box";
 const CLOUDFLARED_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64";
+
+// 初始化 SELF_URL 为 null
+let SELF_URL = null;
+
+// HTTP 请求选项
+const keepAliveOptions = {
+  headers: {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36',
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+  }
+};
+
+let lastSuccess = true;
 
 console.log(`环境配置: ARGO_PORT=${ARGO_PORT} (类型: ${typeof ARGO_PORT}), CFPORT=${CFPORT} (类型: ${typeof CFPORT})`);
 
@@ -35,7 +50,6 @@ function downloadFile(url, dest) {
     console.log(`开始下载: ${url}`);
     
     const handleResponse = (response) => {
-      // 处理重定向
       if (response.statusCode === 302 || response.statusCode === 301) {
         const redirectUrl = response.headers.location;
         console.log(`跟随重定向: ${redirectUrl}`);
@@ -66,7 +80,6 @@ async function setupFiles() {
   await downloadFile(SING_BOX_URL, '1');
   await downloadFile(CLOUDFLARED_URL, '2');
   
-  // 设置可执行权限
   fs.chmodSync('1', 0o755);
   fs.chmodSync('2', 0o755);
 }
@@ -92,8 +105,8 @@ function writeConfig() {
     {
       "tag": "vmess-ws-in",
       "type": "vmess",
-      "listen": "::",
-      "listen_port": ARGO_PORT, // 使用非特权端口
+      "listen": "127.0.0.1", // 改为监听本地回环地址
+      "listen_port": ARGO_PORT + 1, // 使用 ARGO_PORT+1 作为内部端口
         "users": [
         {
           "uuid": UUID
@@ -132,7 +145,6 @@ function setupTunnel() {
     if (ARGO_AUTH.includes('TunnelSecret')) {
       fs.writeFileSync('tunnel.json', ARGO_AUTH);
       
-      // 提取隧道ID
       const match = ARGO_AUTH.match(/"id":"([^"]+)"/);
       const tunnelId = match ? match[1] : 'unknown';
       
@@ -142,7 +154,7 @@ protocol: http2
 
 ingress:
   - hostname: ${ARGO_DOMAIN}
-    service: http://localhost:${ARGO_PORT}  # 隧道指向非特权端口
+    service: http://localhost:${ARGO_PORT}
     originRequest:
       noTLSVerify: true
   - service: http_status:404`;
@@ -157,10 +169,42 @@ ingress:
   }
 }
 
+// 隧道保活函数
+function keepTunnelAlive() {
+  if (!SELF_URL) {
+    console.log('隧道链接未初始化，暂不执行保活');
+    return;
+  }
+
+  const protocol = SELF_URL.startsWith('https') ? https : http;
+  protocol.get(SELF_URL, keepAliveOptions, (res) => {
+    if (res.statusCode >= 200 && res.statusCode < 300) {
+      if (!lastSuccess) {
+        console.log(`隧道保活成功: ${SELF_URL}`);
+        lastSuccess = true;
+      }
+    } else {
+      console.log(`隧道保活失败，状态码: ${res.statusCode}`);
+      lastSuccess = false;
+    }
+    res.resume();
+  }).on('error', (err) => {
+    console.log(`隧道保活请求错误: ${err.message}`);
+    lastSuccess = false;
+  });
+}
+
+// 创建HTTP服务器（仅用于生成响应）
+const httpServer = http.createServer((req, res) => {
+  res.statusCode = 200;
+  res.setHeader('Content-Type', 'text/plain');
+  res.end('OK');
+});
+
 // 启动服务
 async function startServices() {
   return new Promise((resolve, reject) => {
-    console.log(`启动sing-box服务（端口: ${ARGO_PORT}）...`);
+    console.log(`启动sing-box服务（端口: ${ARGO_PORT + 1}）...`);
     // 启动sing-box
     const singBoxProcess = exec('./1 run -c config.json', (error, stdout, stderr) => {
       if (error) {
@@ -176,7 +220,61 @@ async function startServices() {
         execSync('pgrep -f "./1 run"');
         console.log('sing-box启动成功');
         
-        // 启动cloudflared（隧道指向非特权端口）
+        // 创建TCP服务器实现端口复用
+        const tcpServer = net.createServer((socket) => {
+          // 用于判断协议的缓冲区
+          let protocolBuffer = Buffer.alloc(0);
+          let protocolDetermined = false;
+          
+          socket.on('data', (chunk) => {
+            // 合并数据块用于协议检测
+            protocolBuffer = Buffer.concat([protocolBuffer, chunk]);
+            
+            // 只在协议未确定时进行检测
+            if (!protocolDetermined) {
+              // 检测是否为HTTP请求（简单检查是否包含HTTP/1.1或GET/POST等）
+              const isHttp = protocolBuffer.toString('utf8').includes('HTTP/1.1') || 
+                            protocolBuffer.toString('utf8').includes('GET ') || 
+                            protocolBuffer.toString('utf8').includes('POST ');
+              
+              protocolDetermined = true;
+              
+              if (isHttp) {
+                // 处理HTTP请求
+                console.log('接收到HTTP请求，转发到HTTP服务器');
+                httpServer.emit('connection', socket);
+                // 将已接收的数据发送给HTTP服务器
+                socket.unshift(protocolBuffer);
+              } else {
+                // 处理非HTTP请求（转发给sing-box）
+                console.log('接收到非HTTP请求，转发到sing-box');
+                const singBoxSocket = net.connect(ARGO_PORT + 1, '127.0.0.1', () => {
+                  singBoxSocket.write(protocolBuffer);
+                  socket.pipe(singBoxSocket);
+                  singBoxSocket.pipe(socket);
+                });
+                
+                singBoxSocket.on('error', (err) => {
+                  console.error(`连接sing-box失败: ${err.message}`);
+                  socket.destroy();
+                });
+              }
+            }
+          });
+        });
+        
+        // 监听ARGO_PORT
+        tcpServer.listen(ARGO_PORT, () => {
+          console.log(`TCP复用服务器已启动，监听端口: ${ARGO_PORT}`);
+          console.log(`HTTP请求将在此端口处理，其他流量将转发到sing-box (${ARGO_PORT + 1})`);
+        });
+        
+        tcpServer.on('error', (err) => {
+          console.error(`TCP服务器启动失败: ${err.message}`);
+          reject(err);
+        });
+        
+        // 启动cloudflared
         let cloudflaredCommand;
         if (ARGO_AUTH && ARGO_DOMAIN) {
           if (ARGO_AUTH.includes('TunnelSecret')) {
@@ -242,6 +340,7 @@ async function startServices() {
 function getArgoDomain() {
   if (ARGO_DOMAIN) {
     console.log(`使用预设域名: ${ARGO_DOMAIN}`);
+    SELF_URL = `https://${ARGO_DOMAIN}`;
     return Promise.resolve(ARGO_DOMAIN);
   } else {
     console.log('等待Cloudflare分配临时域名...');
@@ -264,7 +363,13 @@ function getArgoDomain() {
           if (match) {
             clearInterval(interval);
             const domain = match[1];
-            console.log(`获取到临时域名: ${domain}`);
+            SELF_URL = `https://${domain}`;
+            console.log(`获取到临时域名: ${domain}，保活链接: ${SELF_URL}`);
+            
+            // 启动保活定时器
+            setInterval(keepTunnelAlive, 30000);
+            console.log('隧道保活机制已启动');
+            
             resolve(domain);
           }
         }
@@ -287,7 +392,7 @@ async function main() {
       "v": "2", 
       "ps": NAME, 
       "add": CFIP, 
-      "port": CFPORT,  // 外部访问端口仍为 443（Cloudflare 会处理转发）
+      "port": CFPORT,
       "id": UUID, 
       "aid": "0", 
       "scy": "none", 
@@ -301,8 +406,10 @@ async function main() {
       "fp": ""
     };
     
+    const vmessBase64 = Buffer.from(JSON.stringify(VMESS)).toString('base64');
+    fs.writeFileSync('boot.log', `vmess://${vmessBase64}`);
+    console.log(`VMess链接已生成: vmess://${vmessBase64}`);
     
-    // 保持进程运行
     await new Promise(() => {});
   } catch (error) {
     console.error('部署过程中出现错误:', error.message);
