@@ -28,27 +28,35 @@ try {
   fs.unlinkSync('tunnel.yml');
 } catch (e) {}
 
-// 下载文件函数
+// 下载文件函数（支持重定向）
 function downloadFile(url, dest) {
   return new Promise((resolve, reject) => {
     console.log(`开始下载: ${url}`);
-    const file = fs.createWriteStream(dest);
-    https.get(url, response => {
+    
+    const handleResponse = (response) => {
+      // 处理重定向
+      if (response.statusCode === 302 || response.statusCode === 301) {
+        const redirectUrl = response.headers.location;
+        console.log(`跟随重定向: ${redirectUrl}`);
+        https.get(redirectUrl, handleResponse).on('error', reject);
+        return;
+      }
+      
       if (response.statusCode !== 200) {
-        file.destroy();
         reject(new Error(`下载失败，状态码: ${response.statusCode}`));
         return;
       }
+      
+      const file = fs.createWriteStream(dest);
       response.pipe(file);
       file.on('finish', () => {
         file.close();
         console.log(`下载完成: ${dest}`);
         resolve();
       });
-    }).on('error', err => {
-      fs.unlink(dest, () => {});
-      reject(err);
-    });
+    };
+    
+    https.get(url, handleResponse).on('error', reject);
   });
 }
 
