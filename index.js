@@ -2,23 +2,21 @@ const { execSync, exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
-const http = require('http');
-const net = require('net'); // 添加net模块用于TCP代理
 
-// 环境变量设置
+// 环境变量设置，关键修改：将默认端口改为 8080（非特权端口）
 const UUID = process.env.UUID || '96ce5271-7a3b-455b-adb3-69772d34d34e';
 const ARGO_AUTH = process.env.ARGO_AUTH || '';
 const CFIP = process.env.CFIP || 'www.visa.com.tw';
 const NAME = process.env.NAME || 'app.koyeb.com';
+// 关键修改：默认端口改为 8080（1024 以上，无需特权）
 const ARGO_PORT = process.env.ARGO_PORT ? parseInt(process.env.ARGO_PORT, 10) : 8080;
-const INTERNAL_SINGBOX_PORT = 8082; // sing-box内部端口
-const CFPORT = process.env.CFPORT ? parseInt(process.env.CFPORT, 10) : 443;
+const CFPORT = process.env.CFPORT ? parseInt(process.env.CFPORT, 10) : 443; // CFPORT 保持 443 不影响，因为是外部访问端口
 const ARGO_DOMAIN = process.env.ARGO_DOMAIN || '';
 const FILE_PATH = process.env.FILE_PATH || 'world';
 const SING_BOX_URL = "https://raw.githubusercontent.com/weishaoaai/sssss/main/sing-box";
 const CLOUDFLARED_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64";
 
-console.log(`环境配置: ARGO_PORT=${ARGO_PORT}, INTERNAL_SINGBOX_PORT=${INTERNAL_SINGBOX_PORT}`);
+console.log(`环境配置: ARGO_PORT=${ARGO_PORT} (类型: ${typeof ARGO_PORT}), CFPORT=${CFPORT} (类型: ${typeof CFPORT})`);
 
 // 创建目录
 fs.mkdirSync(FILE_PATH, { recursive: true });
@@ -31,12 +29,13 @@ try {
   fs.unlinkSync('tunnel.yml');
 } catch (e) {}
 
-// 下载文件函数
+// 下载文件函数（支持重定向）
 function downloadFile(url, dest) {
   return new Promise((resolve, reject) => {
     console.log(`开始下载: ${url}`);
     
     const handleResponse = (response) => {
+      // 处理重定向
       if (response.statusCode === 302 || response.statusCode === 301) {
         const redirectUrl = response.headers.location;
         console.log(`跟随重定向: ${redirectUrl}`);
@@ -67,11 +66,12 @@ async function setupFiles() {
   await downloadFile(SING_BOX_URL, '1');
   await downloadFile(CLOUDFLARED_URL, '2');
   
+  // 设置可执行权限
   fs.chmodSync('1', 0o755);
   fs.chmodSync('2', 0o755);
 }
 
-// 写入配置文件
+// 写入配置文件 - 修改：添加 HTTP inbound 用于保活
 function writeConfig() {
   console.log('生成配置文件: config.json');
   const config = {
@@ -93,7 +93,7 @@ function writeConfig() {
       "tag": "vmess-ws-in",
       "type": "vmess",
       "listen": "::",
-      "listen_port": INTERNAL_SINGBOX_PORT,
+      "listen_port": ARGO_PORT, // 使用非特权端口
         "users": [
         {
           "uuid": UUID
@@ -104,6 +104,17 @@ function writeConfig() {
         "path": "/king",
         "early_data_header_name": "Sec-WebSocket-Protocol"
       }
+    },
+    // 添加 HTTP inbound 用于处理 /200 请求
+    {
+      "tag": "http-keepalive",
+      "type": "http",
+      "listen": "::",
+      "listen_port": ARGO_PORT,
+      "domain_strategy": "prefer_ipv4",
+      "sniff": true,
+      "sniff_override_destination": true,
+      "rule_engine": "golang"
     }
    ],
   "outbounds": [
@@ -117,12 +128,20 @@ function writeConfig() {
     }
   ],
   "route": {
+    "rules": [
+      {
+        "type": "field",
+        "protocol": "http",
+        "path": ["/200"],
+        "outbound_tag": "direct"
+      }
+    ],
     "final": "direct"
   }
   };
   
   fs.writeFileSync('config.json', JSON.stringify(config, null, 2));
-  console.log(`配置文件已生成，sing-box监听端口: ${INTERNAL_SINGBOX_PORT}`);
+  console.log(`配置文件已生成，listen_port=${config.inbounds[0].listen_port} (类型: ${typeof config.inbounds[0].listen_port})`);
 }
 
 // 设置Cloudflare隧道配置
@@ -132,6 +151,7 @@ function setupTunnel() {
     if (ARGO_AUTH.includes('TunnelSecret')) {
       fs.writeFileSync('tunnel.json', ARGO_AUTH);
       
+      // 提取隧道ID
       const match = ARGO_AUTH.match(/"id":"([^"]+)"/);
       const tunnelId = match ? match[1] : 'unknown';
       
@@ -141,7 +161,7 @@ protocol: http2
 
 ingress:
   - hostname: ${ARGO_DOMAIN}
-    service: http://localhost:${ARGO_PORT}
+    service: http://localhost:${ARGO_PORT}  # 隧道指向非特权端口
     originRequest:
       noTLSVerify: true
   - service: http_status:404`;
@@ -156,62 +176,11 @@ ingress:
   }
 }
 
-// 创建TCP代理服务器，根据请求类型分发
-function createProxyServer() {
-  return net.createServer(socket => {
-    let data = Buffer.alloc(0);
-    
-    socket.on('data', chunk => {
-      data = Buffer.concat([data, chunk]);
-      
-      // 检测是否是WebSocket请求
-      const isWebSocket = data.includes(Buffer.from('GET')) && 
-                         data.includes(Buffer.from('Upgrade: websocket'));
-      
-      // 检测是否是针对 /king 路径的请求
-      const isKingPath = data.includes(Buffer.from('/king'));
-      
-      if (isWebSocket && isKingPath) {
-        // WebSocket请求转发给sing-box处理
-        console.log('转发WebSocket请求到sing-box');
-        const singBoxSocket = net.connect(INTERNAL_SINGBOX_PORT, '127.0.0.1', () => {
-          singBoxSocket.write(data);
-          socket.pipe(singBoxSocket);
-          singBoxSocket.pipe(socket);
-        });
-        
-        singBoxSocket.on('error', err => {
-          console.error('sing-box连接错误:', err.message);
-          socket.destroy();
-        });
-      } else {
-        // 普通HTTP请求返回200 OK
-        console.log('处理普通HTTP请求，返回200 OK');
-        socket.write(
-          'HTTP/1.1 200 OK\r\n' +
-          'Content-Type: text/plain\r\n' +
-          'Content-Length: 6\r\n' +
-          'Connection: close\r\n' +
-          '\r\n' +
-          '200 OK\r\n'
-        );
-        socket.destroy();
-      }
-    });
-  });
-}
-
 // 启动服务
 async function startServices() {
   return new Promise((resolve, reject) => {
-    // 创建并启动TCP代理服务器
-    const proxyServer = createProxyServer();
-    proxyServer.listen(ARGO_PORT, () => {
-      console.log(`TCP代理服务器已启动，监听端口 ${ARGO_PORT}`);
-    });
-    
+    console.log(`启动sing-box服务（端口: ${ARGO_PORT}）...`);
     // 启动sing-box
-    console.log(`启动sing-box服务（端口: ${INTERNAL_SINGBOX_PORT}）...`);
     const singBoxProcess = exec('./1 run -c config.json', (error, stdout, stderr) => {
       if (error) {
         console.error(`sing-box启动失败: ${error.message}`);
@@ -226,7 +195,7 @@ async function startServices() {
         execSync('pgrep -f "./1 run"');
         console.log('sing-box启动成功');
         
-        // 启动cloudflared
+        // 启动cloudflared（隧道指向非特权端口）
         let cloudflaredCommand;
         if (ARGO_AUTH && ARGO_DOMAIN) {
           if (ARGO_AUTH.includes('TunnelSecret')) {
@@ -277,7 +246,6 @@ async function startServices() {
     process.on('SIGINT', () => {
       console.log('\n接收到退出信号，正在停止服务...');
       try {
-        proxyServer.close();
         execSync('pkill -f "./1 run"');
         execSync('pkill -f "./2 tunnel"');
         console.log('服务已成功停止');
@@ -338,7 +306,7 @@ async function main() {
       "v": "2", 
       "ps": NAME, 
       "add": CFIP, 
-      "port": CFPORT,
+      "port": CFPORT,  // 外部访问端口仍为 443（Cloudflare 会处理转发）
       "id": UUID, 
       "aid": "0", 
       "scy": "none", 
@@ -352,7 +320,7 @@ async function main() {
       "fp": ""
     };
     
-    console.log(`服务已启动，访问 https://${argodomain} 查看状态`);
+    console.log(`保活功能已启用 - 访问 https://${argodomain}/200 应返回 200 OK`);
     
     // 保持进程运行
     await new Promise(() => {});
