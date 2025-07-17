@@ -4,7 +4,7 @@ const path = require('path');
 const https = require('https');
 
 // 环境变量设置，关键修改：将默认端口改为 8080（非特权端口）
-const UUID = process.env.UUID || '86391f6e-87ca-4665-8445-6a8d413c7fa9';
+const UUID = process.env.UUID || '96ce5271-7a3b-455b-adb3-69772d34d34e';
 const ARGO_AUTH = process.env.ARGO_AUTH || '';
 const CFIP = process.env.CFIP || 'www.visa.com.tw';
 const NAME = process.env.NAME || 'app.koyeb.com';
@@ -301,11 +301,6 @@ async function main() {
       "fp": ""
     };
     
-    const vmessBase64 = Buffer.from(JSON.stringify(VMESS)).toString('base64');
-    fs.writeFileSync('boot.log', `vmess://${vmessBase64}`);
-    
-    console.log("部署完成!");
-    console.log(`VMess链接: vmess://${vmessBase64}`);
     
     // 保持进程运行
     await new Promise(() => {});
