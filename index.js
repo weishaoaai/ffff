@@ -3,13 +3,14 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 
-// 环境变量设置，修正端口为整数类型
+// 环境变量设置，关键修改：将默认端口改为 8080（非特权端口）
 const UUID = process.env.UUID || '86391f6e-87ca-4665-8445-6a8d413c7fa9';
 const ARGO_AUTH = process.env.ARGO_AUTH || '';
 const CFIP = process.env.CFIP || 'www.visa.com.tw';
 const NAME = process.env.NAME || 'app.koyeb.com';
-const ARGO_PORT = process.env.ARGO_PORT ? parseInt(process.env.ARGO_PORT, 10) : 443;
-const CFPORT = process.env.CFPORT ? parseInt(process.env.CFPORT, 10) : 443;
+// 关键修改：默认端口改为 8080（1024 以上，无需特权）
+const ARGO_PORT = process.env.ARGO_PORT ? parseInt(process.env.ARGO_PORT, 10) : 8080;
+const CFPORT = process.env.CFPORT ? parseInt(process.env.CFPORT, 10) : 443; // CFPORT 保持 443 不影响，因为是外部访问端口
 const ARGO_DOMAIN = process.env.ARGO_DOMAIN || '';
 const FILE_PATH = process.env.FILE_PATH || 'world';
 const SING_BOX_URL = "https://raw.githubusercontent.com/weishaoaai/sssss/main/sing-box";
@@ -92,7 +93,7 @@ function writeConfig() {
       "tag": "vmess-ws-in",
       "type": "vmess",
       "listen": "::",
-      "listen_port": ARGO_PORT,
+      "listen_port": ARGO_PORT, // 使用非特权端口
         "users": [
         {
           "uuid": UUID
@@ -141,7 +142,7 @@ protocol: http2
 
 ingress:
   - hostname: ${ARGO_DOMAIN}
-    service: http://localhost:${ARGO_PORT}
+    service: http://localhost:${ARGO_PORT}  # 隧道指向非特权端口
     originRequest:
       noTLSVerify: true
   - service: http_status:404`;
@@ -159,7 +160,7 @@ ingress:
 // 启动服务
 async function startServices() {
   return new Promise((resolve, reject) => {
-    console.log('启动sing-box服务...');
+    console.log(`启动sing-box服务（端口: ${ARGO_PORT}）...`);
     // 启动sing-box
     const singBoxProcess = exec('./1 run -c config.json', (error, stdout, stderr) => {
       if (error) {
@@ -175,7 +176,7 @@ async function startServices() {
         execSync('pgrep -f "./1 run"');
         console.log('sing-box启动成功');
         
-        // 启动cloudflared
+        // 启动cloudflared（隧道指向非特权端口）
         let cloudflaredCommand;
         if (ARGO_AUTH && ARGO_DOMAIN) {
           if (ARGO_AUTH.includes('TunnelSecret')) {
@@ -286,7 +287,7 @@ async function main() {
       "v": "2", 
       "ps": NAME, 
       "add": CFIP, 
-      "port": CFPORT, 
+      "port": CFPORT,  // 外部访问端口仍为 443（Cloudflare 会处理转发）
       "id": UUID, 
       "aid": "0", 
       "scy": "none", 
