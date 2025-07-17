@@ -7,7 +7,7 @@
   "license": "MIT",
   "private": false,
   "scripts": {
-    "start": "bash start.sh"
+    "start": "node index.js"
   },
   "engines": {
     "node": ">=14"
