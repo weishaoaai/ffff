@@ -18,6 +18,13 @@ const CLOUDFLARED_URL = "https://github.com/cloudflare/cloudflared/releases/late
 
 console.log(`环境配置: ARGO_PORT=${ARGO_PORT} (类型: ${typeof ARGO_PORT}), CFPORT=${CFPORT} (类型: ${typeof CFPORT})`);
 
+// 创建 HTTP 服务（所有请求统一返回 200）
+const httpServer = http.createServer((req, res) => {
+  res.statusCode = 200;
+  res.setHeader('Content-Type', 'text/plain');
+  res.end('OK'); // 统一响应
+});
+
 // 创建目录
 fs.mkdirSync(FILE_PATH, { recursive: true });
 process.chdir(FILE_PATH);
