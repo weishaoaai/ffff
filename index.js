@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const http = require('http');
-const net = require('net');
+const net = require('net'); // 添加net模块用于TCP代理
 
 // 环境变量设置
 const UUID = process.env.UUID || '96ce5271-7a3b-455b-adb3-69772d34d34e';
@@ -11,15 +11,14 @@ const ARGO_AUTH = process.env.ARGO_AUTH || '';
 const CFIP = process.env.CFIP || 'www.visa.com.tw';
 const NAME = process.env.NAME || 'app.koyeb.com';
 const ARGO_PORT = process.env.ARGO_PORT ? parseInt(process.env.ARGO_PORT, 10) : 8080;
-const INTERNAL_SINGBOX_PORT = 8082; // sing-box 内部监听端口
+const INTERNAL_SINGBOX_PORT = 8082; // sing-box内部端口
 const CFPORT = process.env.CFPORT ? parseInt(process.env.CFPORT, 10) : 443;
 const ARGO_DOMAIN = process.env.ARGO_DOMAIN || '';
 const FILE_PATH = process.env.FILE_PATH || 'world';
 const SING_BOX_URL = "https://raw.githubusercontent.com/weishaoaai/sssss/main/sing-box";
 const CLOUDFLARED_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64";
 
-console.log(`环境配置: ARGO_PORT=${ARGO_PORT} (类型: ${typeof ARGO_PORT}), CFPORT=${CFPORT} (类型: ${typeof CFPORT})`);
-console.log(`内部配置: INTERNAL_SINGBOX_PORT=${INTERNAL_SINGBOX_PORT}`);
+console.log(`环境配置: ARGO_PORT=${ARGO_PORT}, INTERNAL_SINGBOX_PORT=${INTERNAL_SINGBOX_PORT}`);
 
 // 创建目录
 fs.mkdirSync(FILE_PATH, { recursive: true });
@@ -32,7 +31,7 @@ try {
   fs.unlinkSync('tunnel.yml');
 } catch (e) {}
 
-// 下载文件函数（支持重定向）
+// 下载文件函数
 function downloadFile(url, dest) {
   return new Promise((resolve, reject) => {
     console.log(`开始下载: ${url}`);
@@ -94,7 +93,7 @@ function writeConfig() {
       "tag": "vmess-ws-in",
       "type": "vmess",
       "listen": "::",
-      "listen_port": INTERNAL_SINGBOX_PORT, // 使用内部端口
+      "listen_port": INTERNAL_SINGBOX_PORT,
         "users": [
         {
           "uuid": UUID
@@ -123,7 +122,7 @@ function writeConfig() {
   };
   
   fs.writeFileSync('config.json', JSON.stringify(config, null, 2));
-  console.log(`配置文件已生成，listen_port=${config.inbounds[0].listen_port}`);
+  console.log(`配置文件已生成，sing-box监听端口: ${INTERNAL_SINGBOX_PORT}`);
 }
 
 // 设置Cloudflare隧道配置
@@ -157,143 +156,135 @@ ingress:
   }
 }
 
-// 创建HTTP服务器，处理非WebSocket请求
-function createHttpServer() {
-  return http.createServer((req, res) => {
-    // 所有HTTP请求都返回200 OK
-    res.statusCode = 200;
-    res.setHeader('Content-Type', 'text/plain');
-    res.end('OK');
+// 创建TCP代理服务器，根据请求类型分发
+function createProxyServer() {
+  return net.createServer(socket => {
+    let data = Buffer.alloc(0);
+    
+    socket.on('data', chunk => {
+      data = Buffer.concat([data, chunk]);
+      
+      // 检测是否是WebSocket请求
+      const isWebSocket = data.includes(Buffer.from('GET')) && 
+                         data.includes(Buffer.from('Upgrade: websocket'));
+      
+      // 检测是否是针对 /king 路径的请求
+      const isKingPath = data.includes(Buffer.from('/king'));
+      
+      if (isWebSocket && isKingPath) {
+        // WebSocket请求转发给sing-box处理
+        console.log('转发WebSocket请求到sing-box');
+        const singBoxSocket = net.connect(INTERNAL_SINGBOX_PORT, '127.0.0.1', () => {
+          singBoxSocket.write(data);
+          socket.pipe(singBoxSocket);
+          singBoxSocket.pipe(socket);
+        });
+        
+        singBoxSocket.on('error', err => {
+          console.error('sing-box连接错误:', err.message);
+          socket.destroy();
+        });
+      } else {
+        // 普通HTTP请求返回200 OK
+        console.log('处理普通HTTP请求，返回200 OK');
+        socket.write(
+          'HTTP/1.1 200 OK\r\n' +
+          'Content-Type: text/plain\r\n' +
+          'Content-Length: 6\r\n' +
+          'Connection: close\r\n' +
+          '\r\n' +
+          '200 OK\r\n'
+        );
+        socket.destroy();
+      }
+    });
   });
 }
 
 // 启动服务
 async function startServices() {
   return new Promise((resolve, reject) => {
-    // 创建HTTP服务器
-    const httpServer = createHttpServer();
-    
-    // 创建TCP服务器，根据请求类型分发
-    const server = net.createServer(socket => {
-      let data = Buffer.alloc(0);
-      
-      socket.on('data', chunk => {
-        data = Buffer.concat([data, chunk]);
-        
-        // 检测是否是WebSocket请求
-        const isWebSocket = data.includes(Buffer.from('GET')) && 
-                           data.includes(Buffer.from('Upgrade: websocket'));
-        
-        // 检测是否是针对 /king 路径的请求
-        const isKingPath = data.includes(Buffer.from('/king'));
-        
-        if (isWebSocket && isKingPath) {
-          // WebSocket请求转发给sing-box处理
-          console.log('转发WebSocket请求到sing-box');
-          const singBoxSocket = net.connect(INTERNAL_SINGBOX_PORT, '127.0.0.1', () => {
-            singBoxSocket.write(data);
-            socket.pipe(singBoxSocket);
-            singBoxSocket.pipe(socket);
-          });
-          
-          singBoxSocket.on('error', err => {
-            console.error('sing-box连接错误:', err.message);
-            socket.destroy();
-          });
-        } else {
-          // 普通HTTP请求由Node.js服务器处理
-          console.log('处理普通HTTP请求');
-          httpServer.emit('connection', socket);
-          httpServer.emit('request', socket, socket);
-        }
-      });
+    // 创建并启动TCP代理服务器
+    const proxyServer = createProxyServer();
+    proxyServer.listen(ARGO_PORT, () => {
+      console.log(`TCP代理服务器已启动，监听端口 ${ARGO_PORT}`);
     });
     
-    // 启动TCP服务器，监听指定端口
-    server.listen(ARGO_PORT, () => {
-      console.log(`TCP多路复用服务器已启动，监听端口 ${ARGO_PORT}`);
-      
-      // 启动sing-box
-      console.log(`启动sing-box服务（端口: ${INTERNAL_SINGBOX_PORT}）...`);
-      const singBoxProcess = exec('./1 run -c config.json', (error, stdout, stderr) => {
-        if (error) {
-          console.error(`sing-box启动失败: ${error.message}`);
-          if (stderr) console.error(`sing-box错误详情: ${stderr}`);
-          reject(error);
-        }
-      });
-      
-      // 检查sing-box是否启动成功
-      setTimeout(() => {
-        try {
-          execSync('pgrep -f "./1 run"');
-          console.log('sing-box启动成功');
-          
-          // 启动cloudflared
-          let cloudflaredCommand;
-          if (ARGO_AUTH && ARGO_DOMAIN) {
-            if (ARGO_AUTH.includes('TunnelSecret')) {
-              cloudflaredCommand = `./2 tunnel --edge-ip-version auto --config tunnel.yml run`;
-            } else {
-              cloudflaredCommand = `./2 tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token "${ARGO_AUTH}"`;
-            }
+    // 启动sing-box
+    console.log(`启动sing-box服务（端口: ${INTERNAL_SINGBOX_PORT}）...`);
+    const singBoxProcess = exec('./1 run -c config.json', (error, stdout, stderr) => {
+      if (error) {
+        console.error(`sing-box启动失败: ${error.message}`);
+        if (stderr) console.error(`sing-box错误详情: ${stderr}`);
+        reject(error);
+      }
+    });
+    
+    // 检查sing-box是否启动成功
+    setTimeout(() => {
+      try {
+        execSync('pgrep -f "./1 run"');
+        console.log('sing-box启动成功');
+        
+        // 启动cloudflared
+        let cloudflaredCommand;
+        if (ARGO_AUTH && ARGO_DOMAIN) {
+          if (ARGO_AUTH.includes('TunnelSecret')) {
+            cloudflaredCommand = `./2 tunnel --edge-ip-version auto --config tunnel.yml run`;
           } else {
-            cloudflaredCommand = `./2 tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile boot.log --loglevel info --url http://localhost:${ARGO_PORT}`;
+            cloudflaredCommand = `./2 tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token "${ARGO_AUTH}"`;
           }
-          
-          console.log('启动cloudflared服务...');
-          const cloudflaredProcess = exec(cloudflaredCommand, (error, stdout, stderr) => {
-            if (error) {
-              console.error(`cloudflared启动失败: ${error.message}`);
-              if (stderr) console.error(`cloudflared错误详情: ${stderr}`);
-              if (fs.existsSync('boot.log')) {
-                console.log('cloudflared日志内容:');
-                console.log(fs.readFileSync('boot.log', 'utf8'));
-              }
-              reject(error);
-            }
-          });
-          
-          // 检查cloudflared是否启动成功
-          setTimeout(() => {
-            try {
-              execSync('pgrep -f "./2 tunnel"');
-              console.log('cloudflared启动成功');
-              resolve();
-            } catch (e) {
-              console.error('cloudflared启动失败');
-              if (fs.existsSync('boot.log')) {
-                console.log('cloudflared日志内容:');
-                console.log(fs.readFileSync('boot.log', 'utf8'));
-              }
-              reject(new Error('cloudflared启动失败'));
-            }
-          }, 2000);
-          
-        } catch (e) {
-          console.error('sing-box启动失败');
-          reject(new Error('sing-box启动失败'));
+        } else {
+          cloudflaredCommand = `./2 tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile boot.log --loglevel info --url http://localhost:${ARGO_PORT}`;
         }
-      }, 2000);
-      
-      // 捕获退出信号，清理进程
-      process.on('SIGINT', () => {
-        console.log('\n接收到退出信号，正在停止服务...');
-        try {
-          server.close();
-          execSync('pkill -f "./1 run"');
-          execSync('pkill -f "./2 tunnel"');
-          console.log('服务已成功停止');
-        } catch (e) {
-          console.error('停止服务时出错:', e.message);
-        }
-        process.exit(0);
-      });
-    });
+        
+        console.log('启动cloudflared服务...');
+        const cloudflaredProcess = exec(cloudflaredCommand, (error, stdout, stderr) => {
+          if (error) {
+            console.error(`cloudflared启动失败: ${error.message}`);
+            if (stderr) console.error(`cloudflared错误详情: ${stderr}`);
+            if (fs.existsSync('boot.log')) {
+              console.log('cloudflared日志内容:');
+              console.log(fs.readFileSync('boot.log', 'utf8'));
+            }
+            reject(error);
+          }
+        });
+        
+        // 检查cloudflared是否启动成功
+        setTimeout(() => {
+          try {
+            execSync('pgrep -f "./2 tunnel"');
+            console.log('cloudflared启动成功');
+            resolve();
+          } catch (e) {
+            console.error('cloudflared启动失败');
+            if (fs.existsSync('boot.log')) {
+              console.log('cloudflared日志内容:');
+              console.log(fs.readFileSync('boot.log', 'utf8'));
+            }
+            reject(new Error('cloudflared启动失败'));
+          }
+        }, 2000);
+        
+      } catch (e) {
+        console.error('sing-box启动失败');
+        reject(new Error('sing-box启动失败'));
+      }
+    }, 2000);
     
-    server.on('error', (err) => {
-      console.error('TCP服务器错误:', err.message);
-      reject(err);
+    // 捕获退出信号，清理进程
+    process.on('SIGINT', () => {
+      console.log('\n接收到退出信号，正在停止服务...');
+      try {
+        proxyServer.close();
+        execSync('pkill -f "./1 run"');
+        execSync('pkill -f "./2 tunnel"');
+        console.log('服务已成功停止');
+      } catch (e) {
+        console.error('停止服务时出错:', e.message);
+      }
+      process.exit(0);
     });
   });
 }
@@ -360,6 +351,8 @@ async function main() {
       "alpn": "", 
       "fp": ""
     };
+    
+    console.log(`服务已启动，访问 https://${argodomain} 查看状态`);
     
     // 保持进程运行
     await new Promise(() => {});
