@@ -2,29 +2,22 @@ const { execSync, exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const http = require('http');
+const net = require('net');
 
-// 环境变量设置，关键修改：将默认端口改为 8080（非特权端口）
+// 环境变量设置
 const UUID = process.env.UUID || '96ce5271-7a3b-455b-adb3-69772d34d34e';
 const ARGO_AUTH = process.env.ARGO_AUTH || '';
 const CFIP = process.env.CFIP || 'www.visa.com.tw';
 const NAME = process.env.NAME || 'app.koyeb.com';
-// 关键修改：默认端口改为 8080（1024 以上，无需特权）
 const ARGO_PORT = process.env.ARGO_PORT ? parseInt(process.env.ARGO_PORT, 10) : 8080;
-const CFPORT = process.env.CFPORT ? parseInt(process.env.CFPORT, 10) : 443; // CFPORT 保持 443 不影响，因为是外部访问端口
+const CFPORT = process.env.CFPORT ? parseInt(process.env.CFPORT, 10) : 443;
 const ARGO_DOMAIN = process.env.ARGO_DOMAIN || '';
 const FILE_PATH = process.env.FILE_PATH || 'world';
 const SING_BOX_URL = "https://raw.githubusercontent.com/weishaoaai/sssss/main/sing-box";
 const CLOUDFLARED_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64";
 
-// 新增：保活配置
-const KEEP_ALIVE_INTERVAL = 5 * 60 * 1000; // 5分钟
-const HEALTH_CHECK_PATH = '/'; // 健康检查路径
-const NODE_INFO_PATH = '/king'; // 节点信息路径
-
 console.log(`环境配置: ARGO_PORT=${ARGO_PORT} (类型: ${typeof ARGO_PORT}), CFPORT=${CFPORT} (类型: ${typeof CFPORT})`);
-
-// 初始化 SELF_URL 为 null
-let SELF_URL = null;
 
 // 创建目录
 fs.mkdirSync(FILE_PATH, { recursive: true });
@@ -43,7 +36,6 @@ function downloadFile(url, dest) {
     console.log(`开始下载: ${url}`);
     
     const handleResponse = (response) => {
-      // 处理重定向
       if (response.statusCode === 302 || response.statusCode === 301) {
         const redirectUrl = response.headers.location;
         console.log(`跟随重定向: ${redirectUrl}`);
@@ -74,7 +66,6 @@ async function setupFiles() {
   await downloadFile(SING_BOX_URL, '1');
   await downloadFile(CLOUDFLARED_URL, '2');
   
-  // 设置可执行权限
   fs.chmodSync('1', 0o755);
   fs.chmodSync('2', 0o755);
 }
@@ -101,7 +92,7 @@ function writeConfig() {
       "tag": "vmess-ws-in",
       "type": "vmess",
       "listen": "::",
-      "listen_port": ARGO_PORT, // 使用非特权端口
+      "listen_port": ARGO_PORT,
         "users": [
         {
           "uuid": UUID
@@ -130,7 +121,7 @@ function writeConfig() {
   };
   
   fs.writeFileSync('config.json', JSON.stringify(config, null, 2));
-  console.log(`配置文件已生成，listen_port=${config.inbounds[0].listen_port} (类型: ${typeof config.inbounds[0].listen_port})`);
+  console.log(`配置文件已生成，listen_port=${config.inbounds[0].listen_port}`);
 }
 
 // 设置Cloudflare隧道配置
@@ -140,7 +131,6 @@ function setupTunnel() {
     if (ARGO_AUTH.includes('TunnelSecret')) {
       fs.writeFileSync('tunnel.json', ARGO_AUTH);
       
-      // 提取隧道ID
       const match = ARGO_AUTH.match(/"id":"([^"]+)"/);
       const tunnelId = match ? match[1] : 'unknown';
       
@@ -150,7 +140,7 @@ protocol: http2
 
 ingress:
   - hostname: ${ARGO_DOMAIN}
-    service: http://localhost:${ARGO_PORT}  # 隧道指向非特权端口
+    service: http://localhost:${ARGO_PORT}
     originRequest:
       noTLSVerify: true
   - service: http_status:404`;
@@ -165,83 +155,143 @@ ingress:
   }
 }
 
+// 创建HTTP服务器，处理非WebSocket请求
+function createHttpServer() {
+  return http.createServer((req, res) => {
+    // 所有HTTP请求都返回200 OK
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'text/plain');
+    res.end('OK');
+  });
+}
+
 // 启动服务
 async function startServices() {
   return new Promise((resolve, reject) => {
-    console.log(`启动sing-box服务（端口: ${ARGO_PORT}）...`);
-    // 启动sing-box
-    const singBoxProcess = exec('./1 run -c config.json', (error, stdout, stderr) => {
-      if (error) {
-        console.error(`sing-box启动失败: ${error.message}`);
-        if (stderr) console.error(`sing-box错误详情: ${stderr}`);
-        reject(error);
-      }
+    // 创建HTTP服务器
+    const httpServer = createHttpServer();
+    
+    // 创建TCP服务器，根据请求类型分发
+    const server = net.createServer(socket => {
+      let data = Buffer.alloc(0);
+      
+      socket.on('data', chunk => {
+        data = Buffer.concat([data, chunk]);
+        
+        // 检测是否是WebSocket请求
+        const isWebSocket = data.includes(Buffer.from('GET')) && 
+                           data.includes(Buffer.from('Upgrade: websocket'));
+        
+        // 检测是否是针对 /king 路径的请求
+        const isKingPath = data.includes(Buffer.from('/king'));
+        
+        if (isWebSocket && isKingPath) {
+          // WebSocket请求转发给sing-box处理
+          console.log('转发WebSocket请求到sing-box');
+          const singBoxSocket = net.connect(ARGO_PORT, '127.0.0.1', () => {
+            singBoxSocket.write(data);
+            socket.pipe(singBoxSocket);
+            singBoxSocket.pipe(socket);
+          });
+          
+          singBoxSocket.on('error', err => {
+            console.error('sing-box连接错误:', err.message);
+            socket.destroy();
+          });
+        } else {
+          // 普通HTTP请求由Node.js服务器处理
+          console.log('处理普通HTTP请求');
+          httpServer.emit('connection', socket);
+          httpServer.emit('request', socket, socket);
+        }
+      });
     });
     
-    // 检查sing-box是否启动成功
-    setTimeout(() => {
-      try {
-        execSync('pgrep -f "./1 run"');
-        console.log('sing-box启动成功');
-        
-        // 启动cloudflared（隧道指向非特权端口）
-        let cloudflaredCommand;
-        if (ARGO_AUTH && ARGO_DOMAIN) {
-          if (ARGO_AUTH.includes('TunnelSecret')) {
-            cloudflaredCommand = `./2 tunnel --edge-ip-version auto --config tunnel.yml run`;
-          } else {
-            cloudflaredCommand = `./2 tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token "${ARGO_AUTH}"`;
-          }
-        } else {
-          cloudflaredCommand = `./2 tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile boot.log --loglevel info --url http://localhost:${ARGO_PORT}`;
+    // 启动TCP服务器，监听指定端口
+    server.listen(ARGO_PORT, () => {
+      console.log(`TCP多路复用服务器已启动，监听端口 ${ARGO_PORT}`);
+      
+      // 启动sing-box
+      console.log(`启动sing-box服务（端口: ${ARGO_PORT}）...`);
+      const singBoxProcess = exec('./1 run -c config.json', (error, stdout, stderr) => {
+        if (error) {
+          console.error(`sing-box启动失败: ${error.message}`);
+          if (stderr) console.error(`sing-box错误详情: ${stderr}`);
+          reject(error);
         }
-        
-        console.log('启动cloudflared服务...');
-        const cloudflaredProcess = exec(cloudflaredCommand, (error, stdout, stderr) => {
-          if (error) {
-            console.error(`cloudflared启动失败: ${error.message}`);
-            if (stderr) console.error(`cloudflared错误详情: ${stderr}`);
-            if (fs.existsSync('boot.log')) {
-              console.log('cloudflared日志内容:');
-              console.log(fs.readFileSync('boot.log', 'utf8'));
+      });
+      
+      // 检查sing-box是否启动成功
+      setTimeout(() => {
+        try {
+          execSync('pgrep -f "./1 run"');
+          console.log('sing-box启动成功');
+          
+          // 启动cloudflared
+          let cloudflaredCommand;
+          if (ARGO_AUTH && ARGO_DOMAIN) {
+            if (ARGO_AUTH.includes('TunnelSecret')) {
+              cloudflaredCommand = `./2 tunnel --edge-ip-version auto --config tunnel.yml run`;
+            } else {
+              cloudflaredCommand = `./2 tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token "${ARGO_AUTH}"`;
             }
-            reject(error);
+          } else {
+            cloudflaredCommand = `./2 tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile boot.log --loglevel info --url http://localhost:${ARGO_PORT}`;
           }
-        });
-        
-        // 检查cloudflared是否启动成功
-        setTimeout(() => {
-          try {
-            execSync('pgrep -f "./2 tunnel"');
-            console.log('cloudflared启动成功');
-            resolve();
-          } catch (e) {
-            console.error('cloudflared启动失败');
-            if (fs.existsSync('boot.log')) {
-              console.log('cloudflared日志内容:');
-              console.log(fs.readFileSync('boot.log', 'utf8'));
+          
+          console.log('启动cloudflared服务...');
+          const cloudflaredProcess = exec(cloudflaredCommand, (error, stdout, stderr) => {
+            if (error) {
+              console.error(`cloudflared启动失败: ${error.message}`);
+              if (stderr) console.error(`cloudflared错误详情: ${stderr}`);
+              if (fs.existsSync('boot.log')) {
+                console.log('cloudflared日志内容:');
+                console.log(fs.readFileSync('boot.log', 'utf8'));
+              }
+              reject(error);
             }
-            reject(new Error('cloudflared启动失败'));
-          }
-        }, 2000);
-        
-      } catch (e) {
-        console.error('sing-box启动失败');
-        reject(new Error('sing-box启动失败'));
-      }
-    }, 2000);
+          });
+          
+          // 检查cloudflared是否启动成功
+          setTimeout(() => {
+            try {
+              execSync('pgrep -f "./2 tunnel"');
+              console.log('cloudflared启动成功');
+              resolve();
+            } catch (e) {
+              console.error('cloudflared启动失败');
+              if (fs.existsSync('boot.log')) {
+                console.log('cloudflared日志内容:');
+                console.log(fs.readFileSync('boot.log', 'utf8'));
+              }
+              reject(new Error('cloudflared启动失败'));
+            }
+          }, 2000);
+          
+        } catch (e) {
+          console.error('sing-box启动失败');
+          reject(new Error('sing-box启动失败'));
+        }
+      }, 2000);
+      
+      // 捕获退出信号，清理进程
+      process.on('SIGINT', () => {
+        console.log('\n接收到退出信号，正在停止服务...');
+        try {
+          server.close();
+          execSync('pkill -f "./1 run"');
+          execSync('pkill -f "./2 tunnel"');
+          console.log('服务已成功停止');
+        } catch (e) {
+          console.error('停止服务时出错:', e.message);
+        }
+        process.exit(0);
+      });
+    });
     
-    // 捕获退出信号，清理进程
-    process.on('SIGINT', () => {
-      console.log('\n接收到退出信号，正在停止服务...');
-      try {
-        execSync('pkill -f "./1 run"');
-        execSync('pkill -f "./2 tunnel"');
-        console.log('服务已成功停止');
-      } catch (e) {
-        console.error('停止服务时出错:', e.message);
-      }
-      process.exit(0);
+    server.on('error', (err) => {
+      console.error('TCP服务器错误:', err.message);
+      reject(err);
     });
   });
 }
@@ -273,53 +323,12 @@ function getArgoDomain() {
             clearInterval(interval);
             const domain = match[1];
             console.log(`获取到临时域名: ${domain}`);
-            // 更新 SELF_URL
-            SELF_URL = `https://${domain}`;
             resolve(domain);
           }
         }
       }, 2000);
     });
   }
-}
-
-// 新增：保活函数 - 定期请求隧道URL保持连接
-function startKeepAlive(url) {
-  if (!url) {
-    console.log('无法启动保活机制：URL未定义');
-    return;
-  }
-
-  console.log(`启动保活机制，每${KEEP_ALIVE_INTERVAL / 1000 / 60}分钟请求一次 ${url}`);
-  
-  // 立即执行第一次请求
-  keepAliveRequest(url, HEALTH_CHECK_PATH);
-  
-  // 设置定时请求
-  setInterval(() => {
-    keepAliveRequest(url, HEALTH_CHECK_PATH);
-    
-    // 每小时请求一次节点信息路径
-    if (new Date().getMinutes() === 0) {
-      keepAliveRequest(url, NODE_INFO_PATH);
-    }
-  }, KEEP_ALIVE_INTERVAL);
-}
-
-// 新增：执行保活请求
-function keepAliveRequest(baseUrl, path) {
-  const fullUrl = `${baseUrl}${path}`;
-  console.log(`发送保活请求: ${fullUrl}`);
-  
-  https.get(fullUrl, (res) => {
-    console.log(`保活请求 ${path} 响应状态码: ${res.statusCode}`);
-    
-    res.on('data', () => {}); // 消耗响应数据以释放内存
-    
-    res.on('end', () => {});
-  }).on('error', (err) => {
-    console.error(`保活请求 ${path} 失败: ${err.message}`);
-  });
 }
 
 // 主函数
@@ -332,15 +341,11 @@ async function main() {
     await startServices();
     const argodomain = await getArgoDomain();
     
-    // 更新 SELF_URL
-    SELF_URL = ARGO_DOMAIN ? `https://${ARGO_DOMAIN}` : `https://${argodomain}`;
-    console.log(`服务URL: ${SELF_URL}`);
-    
     const VMESS = { 
       "v": "2", 
       "ps": NAME, 
       "add": CFIP, 
-      "port": CFPORT,  // 外部访问端口仍为 443（Cloudflare 会处理转发）
+      "port": CFPORT,
       "id": UUID, 
       "aid": "0", 
       "scy": "none", 
@@ -353,9 +358,6 @@ async function main() {
       "alpn": "", 
       "fp": ""
     };
-    
-    // 启动保活机制
-    startKeepAlive(SELF_URL);
     
     // 保持进程运行
     await new Promise(() => {});
